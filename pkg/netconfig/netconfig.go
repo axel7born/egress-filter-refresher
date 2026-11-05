@@ -7,11 +7,12 @@ package netconfig
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 )
 
 const (
-	ipSetsMaxLen         = "65536"
+	ipSetsMaxLen         = 65536
 	ipTablesLoggingChain = "POLICY_LOGGING"
 	ipTablesLogPrefix    = "Policy-Filter-Dropped:"
 	ipTablesLogLimit     = "10/min"
@@ -147,7 +148,7 @@ func InitIPSet(ipVersion, ipSetName string) error {
 	}
 	fmt.Printf("Initially creating ipset with name %s\n", ipSetName)
 	if err := DefaultNetUtilsCommandExecutor.ExecuteIPSetCommand("list", ipSetName); err != nil {
-		err := DefaultNetUtilsCommandExecutor.ExecuteIPSetCommand("create", ipSetName, "hash:net", "family", "inet"+ipVersion, "maxelem", ipSetsMaxLen)
+		err := DefaultNetUtilsCommandExecutor.ExecuteIPSetCommand("create", ipSetName, "hash:net", "family", "inet"+ipVersion, "maxelem", strconv.Itoa(ipSetsMaxLen))
 		if err != nil {
 			return fmt.Errorf("error creating IP set %s: %v", ipSetName, err)
 		}
@@ -220,25 +221,89 @@ func prepareAddrs(ipVersion string, content string, trimSuffix bool) []string {
 }
 
 func AddIPListToIPSet(ipVersion, ipSetName string, content string) error {
-
-	addrs := prepareAddrs(ipVersion, content, false)
-
-	for i, addr := range addrs {
-		addrs[i] = "-A " + ipSetName + " " + addr
+	addrs, err := prepareIPSetEntries(ipVersion, content)
+	if err != nil {
+		return err
 	}
-	addrs = append(addrs, "quit\n")
+	return populateIPSet(ipSetName, addrs)
+}
 
-	err := DefaultNetUtilsCommandExecutor.ExecuteIPSetScript(strings.Join(addrs, "\n"))
+func prepareIPSetEntries(ipVersion, content string) ([]string, error) {
+	prepared := prepareAddrs(ipVersion, content, false)
+	unique := make([]string, 0, len(prepared))
+	seen := make(map[string]struct{}, len(prepared))
+	for _, addr := range prepared {
+		addr = normalizeIPSetEntry(addr)
+		if _, ok := seen[addr]; ok {
+			continue
+		}
+		seen[addr] = struct{}{}
+		unique = append(unique, addr)
+	}
+	if len(unique) > ipSetsMaxLen {
+		return nil, fmt.Errorf("ipset entry count %d exceeds maxelem %d", len(unique), ipSetsMaxLen)
+	}
+	return unique, nil
+}
+
+func normalizeIPSetEntry(addr string) string {
+	if _, ipNet, err := net.ParseCIDR(addr); err == nil {
+		return ipNet.String()
+	}
+	if ip := net.ParseIP(addr); ip != nil {
+		if ipv4 := ip.To4(); ipv4 != nil {
+			return ipv4.String() + "/32"
+		}
+		return ip.String() + "/128"
+	}
+	return addr
+}
+
+func populateIPSet(ipSetName string, addrs []string) error {
+	commands := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		commands = append(commands, "add "+ipSetName+" "+addr)
+	}
+	script := strings.Join(commands, "\n") + "\n"
+	err := DefaultNetUtilsCommandExecutor.ExecuteIPSetScript(script)
 	if err != nil {
 		return fmt.Errorf("error adding addresses to ipset %w", err)
 	}
-	addedTotal := len(addrs) - 1
-	fmt.Printf("Added %d entries to ipset '%s'.\n", addedTotal, ipSetName)
+	output, err := DefaultNetUtilsCommandExecutor.ExecuteIPSetCommandWithOutput("list", "-t", ipSetName)
+	if err != nil {
+		return fmt.Errorf("error verifying entries in ipset %s: %w", ipSetName, err)
+	}
+	actualCount, err := ipSetEntryCount(output)
+	if err != nil {
+		return fmt.Errorf("error verifying entries in ipset %s: %w", ipSetName, err)
+	}
+	if actualCount != len(addrs) {
+		return fmt.Errorf("ipset %s contains %d entries; expected %d", ipSetName, actualCount, len(addrs))
+	}
+	fmt.Printf("Added %d entries to ipset '%s'.\n", actualCount, ipSetName)
 
 	return nil
 }
 
+func ipSetEntryCount(output string) (int, error) {
+	for _, line := range strings.Split(output, "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if ok && strings.TrimSpace(key) == "Number of entries" {
+			count, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil {
+				return 0, fmt.Errorf("invalid ipset entry count %q: %w", value, err)
+			}
+			return count, nil
+		}
+	}
+	return 0, fmt.Errorf("ipset output does not contain an entry count")
+}
+
 func UpdateIPSet(ipVersion, ipSetName, egressFilterList, defaultNetworkDevice string, blockIngress bool) error {
+	addrs, err := prepareIPSetEntries(ipVersion, egressFilterList)
+	if err != nil {
+		return fmt.Errorf("error preparing entries for temporary ipset: %w", err)
+	}
 	inetVersion := ""
 	if ipVersion == "6" {
 		inetVersion = "6"
@@ -253,14 +318,14 @@ func UpdateIPSet(ipVersion, ipSetName, egressFilterList, defaultNetworkDevice st
 	}()
 
 	fmt.Printf("Creating temporary ipset with name \"%s\"...\n", tmpIPSet)
-	err := DefaultNetUtilsCommandExecutor.ExecuteIPSetCommand("create", tmpIPSet, "hash:net", "family", "inet"+inetVersion, "maxelem", ipSetsMaxLen)
+	err = DefaultNetUtilsCommandExecutor.ExecuteIPSetCommand("create", tmpIPSet, "hash:net", "family", "inet"+inetVersion, "maxelem", strconv.Itoa(ipSetsMaxLen))
 	if err != nil {
 		return fmt.Errorf("error creating temporary ipset: %w", err)
 	}
 
 	fmt.Printf("Temporary ipset with name \"%s\" created successfully.\n", tmpIPSet)
 
-	err = AddIPListToIPSet(ipVersion, tmpIPSet, egressFilterList)
+	err = populateIPSet(tmpIPSet, addrs)
 	if err != nil {
 		return fmt.Errorf("error adding entries to temporary ipset: %w", err)
 	}

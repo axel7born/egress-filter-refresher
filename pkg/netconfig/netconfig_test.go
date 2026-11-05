@@ -6,6 +6,7 @@ package netconfig_test
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -197,17 +198,18 @@ line with []
 - 9.8.7.16/28
 
 `
-			ipSetScript := `-A test-ipset 1.2.3.4/32
--A test-ipset 5.6.7.0/24
--A test-ipset 9.8.7.16/28
-quit
+			ipSetScript := `add test-ipset 1.2.3.4/32
+add test-ipset 5.6.7.0/24
+add test-ipset 9.8.7.16/28
 `
+			netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockIPSetCommandStdOut = "Number of entries: 3\n"
 			err := netconfig.AddIPListToIPSet("4", "test-ipset", ipList)
 			Expect(err).To(BeNil())
-			Expect(len(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds)).To(Equal(1))
-			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[0].Args).To(Equal([]string{"ipset", "-"}))
+			Expect(len(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds)).To(Equal(2))
+			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[0].Args).To(Equal([]string{"ipset", "restore", "-exist"}))
 			buf, _ := io.ReadAll(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[0].Stdin)
 			Expect(string(buf)).To(Equal(ipSetScript))
+			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[1].Args).To(Equal([]string{"ipset", "list", "-t", "test-ipset"}))
 		})
 		It("Adds NAT64 entries for IPv4 addresses when ipVersion is 6", func() {
 			ipList := `
@@ -216,17 +218,39 @@ line with []
 - 5.6.7.0/24
 - 9.8.7.16/28
 `
-			expectedScript := `-A test-ipset 64:ff9b::102:304/128
--A test-ipset 64:ff9b::506:700/120
--A test-ipset 64:ff9b::908:710/124
-quit
+			expectedScript := `add test-ipset 64:ff9b::102:304/128
+add test-ipset 64:ff9b::506:700/120
+add test-ipset 64:ff9b::908:710/124
 `
+			netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockIPSetCommandStdOut = "Number of entries: 3\n"
 			err := netconfig.AddIPListToIPSet("6", "test-ipset", ipList)
 			Expect(err).To(BeNil())
-			Expect(len(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds)).To(Equal(1))
-			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[0].Args).To(Equal([]string{"ipset", "-"}))
+			Expect(len(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds)).To(Equal(2))
+			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[0].Args).To(Equal([]string{"ipset", "restore", "-exist"}))
 			buf, _ := io.ReadAll(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[0].Stdin)
 			Expect(string(buf)).To(Equal(expectedScript))
+			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[1].Args).To(Equal([]string{"ipset", "list", "-t", "test-ipset"}))
+		})
+		It("returns an error when the restored entry count does not match", func() {
+			mockExecutor := netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor)
+			mockExecutor.MockIPSetCommandStdOut = "Number of entries: 1\n"
+			err := netconfig.AddIPListToIPSet("4", "test-ipset", "- 1.2.3.4/32\n- 5.6.7.0/24\n")
+			Expect(err).To(MatchError("ipset test-ipset contains 1 entries; expected 2"))
+		})
+		It("returns an error when restore fails", func() {
+			mockExecutor := netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor)
+			mockExecutor.MockIPSetScriptError = errors.New("restore failed")
+			err := netconfig.AddIPListToIPSet("4", "test-ipset", "- 1.2.3.4/32\n")
+			Expect(err).To(MatchError(ContainSubstring("error adding addresses to ipset")))
+		})
+		It("rejects lists larger than maxelem before invoking ipset", func() {
+			var content strings.Builder
+			for i := 0; i <= 65536; i++ {
+				fmt.Fprintf(&content, "- 192.%d.%d.%d\n", (i>>16)&255, (i>>8)&255, i&255)
+			}
+			err := netconfig.AddIPListToIPSet("4", "test-ipset", content.String())
+			Expect(err).To(MatchError(ContainSubstring("exceeds maxelem 65536")))
+			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds).To(BeEmpty())
 		})
 	})
 
@@ -239,15 +263,26 @@ line with []
 - 9.8.7.16/28
 
 `
+			netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockIPSetCommandStdOut = "Number of entries: 3\n"
 			err := netconfig.UpdateIPSet("4", "test-ipset", ipList, "ens5", false)
 			Expect(err).To(BeNil())
-			Expect(len(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds)).To(Equal(6))
+			Expect(len(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds)).To(Equal(7))
 			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[0].Args).To(Equal([]string{"ipset", "create", "tmpIPSet", "hash:net", "family", "inet", "maxelem", "65536"}))
-			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[1].Args).To(Equal([]string{"ipset", "-"}))
-			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[2].Args).To(Equal([]string{"iptables-legacy", "-w", "-t", "mangle", "-C", "POSTROUTING", "-o", "ens5", "-p", "tcp", "--syn", "-m", "set", "--match-set", "test-ipset", "dst", "-j", "POLICY_LOGGING"}))
-			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[3].Args).To(Equal([]string{"iptables-legacy", "-w", "-t", "mangle", "-C", "POSTROUTING", "-o", "ens5", "-p", "udp", "-m", "set", "--match-set", "test-ipset", "dst", "-j", "POLICY_LOGGING"}))
-			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[4].Args).To(Equal([]string{"ipset", "swap", "tmpIPSet", "test-ipset"}))
-			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[5].Args).To(Equal([]string{"ipset", "destroy", "tmpIPSet"}))
+			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[1].Args).To(Equal([]string{"ipset", "restore", "-exist"}))
+			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[2].Args).To(Equal([]string{"ipset", "list", "-t", "tmpIPSet"}))
+			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[3].Args).To(Equal([]string{"iptables-legacy", "-w", "-t", "mangle", "-C", "POSTROUTING", "-o", "ens5", "-p", "tcp", "--syn", "-m", "set", "--match-set", "test-ipset", "dst", "-j", "POLICY_LOGGING"}))
+			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[4].Args).To(Equal([]string{"iptables-legacy", "-w", "-t", "mangle", "-C", "POSTROUTING", "-o", "ens5", "-p", "udp", "-m", "set", "--match-set", "test-ipset", "dst", "-j", "POLICY_LOGGING"}))
+			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[5].Args).To(Equal([]string{"ipset", "swap", "tmpIPSet", "test-ipset"}))
+			Expect(netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor).MockCmds[6].Args).To(Equal([]string{"ipset", "destroy", "tmpIPSet"}))
+		})
+		It("does not swap when restoring the temporary set fails", func() {
+			mockExecutor := netconfig.DefaultNetUtilsCommandExecutor.(*netconfig.MockNetUtilsCommandExecutor)
+			mockExecutor.MockIPSetScriptError = errors.New("restore failed")
+			err := netconfig.UpdateIPSet("4", "test-ipset", "- 1.2.3.4/32\n", "ens5", false)
+			Expect(err).To(HaveOccurred())
+			for _, cmd := range mockExecutor.MockCmds {
+				Expect(cmd.Args).NotTo(ContainElement("swap"))
+			}
 		})
 	})
 

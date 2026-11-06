@@ -120,12 +120,13 @@ func wrapCmdStdin(name string, stdIn io.Reader, arg ...string) (string, error) {
 }
 
 type MockNetUtilsCommandExecutor struct {
-	MockCmds               []*exec.Cmd
-	MockIPRoutesStdOut     string
-	MockIPSetCommandStdOut string
-	MockCheckError         error
-	MockIPSetScriptError   error
-	ipTablesBackend        string
+	MockCmds                []*exec.Cmd
+	MockIPRoutesStdOut      string
+	MockIPSetSaveStdOut     string
+	MockCheckError          error
+	MockIPTablesAppendError error
+	MockIPSetScriptError    error
+	ipTablesBackend         string
 }
 
 func (m *MockNetUtilsCommandExecutor) ExecuteIPRouteCommand(ipVersion string, args ...string) (string, error) {
@@ -145,6 +146,9 @@ func (m *MockNetUtilsCommandExecutor) ExecuteIPTablesCommand(ipVersion string, a
 	if args[3] == "-C" || args[3] == "-L" {
 		return m.MockCheckError
 	}
+	if args[3] == "-A" {
+		return m.MockIPTablesAppendError
+	}
 	return nil
 }
 
@@ -156,10 +160,14 @@ func (m *MockNetUtilsCommandExecutor) ExecuteIPSetCommand(args ...string) error 
 func (m *MockNetUtilsCommandExecutor) ExecuteIPSetCommandWithOutput(args ...string) (string, error) {
 	cmd := exec.Command("ipset", args...)
 	m.MockCmds = append(m.MockCmds, cmd)
-	if args[0] == "list" {
-		return m.MockIPSetCommandStdOut, m.MockCheckError
+	switch args[0] {
+	case "list":
+		return "", m.MockCheckError
+	case "save":
+		return m.MockIPSetSaveStdOut, nil
+	default:
+		return "", nil
 	}
-	return m.MockIPSetCommandStdOut, nil
 }
 
 func (m *MockNetUtilsCommandExecutor) ExecuteIPSetScript(script string) error {

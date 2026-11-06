@@ -269,34 +269,33 @@ func populateIPSet(ipSetName string, addrs []string) error {
 	if err != nil {
 		return fmt.Errorf("error adding addresses to ipset %w", err)
 	}
-	output, err := DefaultNetUtilsCommandExecutor.ExecuteIPSetCommandWithOutput("list", "-t", ipSetName)
-	if err != nil {
-		return fmt.Errorf("error verifying entries in ipset %s: %w", ipSetName, err)
-	}
-	actualCount, err := ipSetEntryCount(output)
-	if err != nil {
-		return fmt.Errorf("error verifying entries in ipset %s: %w", ipSetName, err)
-	}
-	if actualCount != len(addrs) {
-		return fmt.Errorf("ipset %s contains %d entries; expected %d", ipSetName, actualCount, len(addrs))
-	}
-	fmt.Printf("Added %d entries to ipset '%s'.\n", actualCount, ipSetName)
+	fmt.Printf("Submitted %d entries to ipset '%s'.\n", len(addrs), ipSetName)
 
 	return nil
 }
 
-func ipSetEntryCount(output string) (int, error) {
+func ipSetEntryCount(output, ipSetName string) (int, error) {
+	setFound := false
+	entryCount := 0
 	for _, line := range strings.Split(output, "\n") {
-		key, value, ok := strings.Cut(line, ":")
-		if ok && strings.TrimSpace(key) == "Number of entries" {
-			count, err := strconv.Atoi(strings.TrimSpace(value))
-			if err != nil {
-				return 0, fmt.Errorf("invalid ipset entry count %q: %w", value, err)
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[1] != ipSetName {
+			continue
+		}
+		switch fields[0] {
+		case "create":
+			setFound = true
+		case "add":
+			if len(fields) < 3 {
+				return 0, fmt.Errorf("invalid ipset save entry %q", line)
 			}
-			return count, nil
+			entryCount++
 		}
 	}
-	return 0, fmt.Errorf("ipset output does not contain an entry count")
+	if !setFound {
+		return 0, fmt.Errorf("ipset save output does not contain set %s", ipSetName)
+	}
+	return entryCount, nil
 }
 
 func UpdateIPSet(ipVersion, ipSetName, egressFilterList, defaultNetworkDevice string, blockIngress bool) error {
@@ -329,17 +328,28 @@ func UpdateIPSet(ipVersion, ipSetName, egressFilterList, defaultNetworkDevice st
 	if err != nil {
 		return fmt.Errorf("error adding entries to temporary ipset: %w", err)
 	}
-	fmt.Println("Added entries into temporary ipset successfully.")
-
-	err = AddIPTablesLoggingRules(ipVersion, ipSetName, defaultNetworkDevice, blockIngress)
+	output, err := DefaultNetUtilsCommandExecutor.ExecuteIPSetCommandWithOutput("save", tmpIPSet)
 	if err != nil {
-		return fmt.Errorf("error adding iptables rules %w", err)
+		return fmt.Errorf("error verifying entries in temporary ipset: %w", err)
 	}
+	actualCount, err := ipSetEntryCount(output, tmpIPSet)
+	if err != nil {
+		return fmt.Errorf("error verifying entries in temporary ipset: %w", err)
+	}
+	if actualCount != len(addrs) {
+		return fmt.Errorf("temporary ipset contains %d entries; expected %d", actualCount, len(addrs))
+	}
+	fmt.Println("Added entries into temporary ipset successfully.")
 
 	fmt.Printf("Swapping new ipset '%s' against old one '%s'\n", tmpIPSet, ipSetName)
 	err = DefaultNetUtilsCommandExecutor.ExecuteIPSetCommand("swap", tmpIPSet, ipSetName)
 	if err != nil {
 		return fmt.Errorf("error swapping ipsets: %w", err)
+	}
+
+	err = AddIPTablesLoggingRules(ipVersion, ipSetName, defaultNetworkDevice, blockIngress)
+	if err != nil {
+		return fmt.Errorf("error adding iptables rules %w", err)
 	}
 
 	return nil
